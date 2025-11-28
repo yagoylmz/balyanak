@@ -18,7 +18,7 @@ except:
     SPOTIFY_ENABLED = False
     print(">> UYARI: Spotify API eksik. Sadece YouTube modunda çalışacak.")
 
-# --- 2. YOUTUBE VE FFMEG AYARLARI (Turbo Mod) ---
+# --- 2. YOUTUBE VE FFMEG AYARLARI ---
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
@@ -33,13 +33,12 @@ YTDL_OPTIONS = {
     'source_address': '0.0.0.0',
 }
 
-# Düşük gecikme (Low Latency) için optimize edildi
+# Network hatalarına karşı daha dirençli ayarlar
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 10M -analyzeduration 10M',
     'options': '-vn',
 }
 
-# Ses Efektleri
 FFMPEG_FILTERS = {
     'normal': {},
     'bass': {'options': '-vn -af bass=g=20'},
@@ -63,12 +62,12 @@ class YTDLSource(discord.PCMVolumeTransformer):
         
         if not url.startswith("http"): url = f"ytsearch:{url}"
         
+        # Blocking (Bloklayan) işlemi Executor'a taşıdık
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
         if 'entries' in data: data = data['entries'][0]
         
         filename = data['url'] if stream else ytdl.prepare_filename(data)
         
-        # Filtreleri Uygula
         current_opts = FFMPEG_OPTIONS.copy()
         if filter_type in FFMPEG_FILTERS:
             current_opts.update(FFMPEG_FILTERS[filter_type])
@@ -115,13 +114,29 @@ class MusicControlView(discord.ui.View):
     @discord.ui.button(label="Çal", style=discord.ButtonStyle.green, emoji="▶️", row=0)
     async def play_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(SongRequestModal(self.music_cog, self.ctx))
+
+    # --- YENİ EKLENEN BUTON: DURAKLAT/DEVAM ---
+    @discord.ui.button(label="Dur/Devam", style=discord.ButtonStyle.blurple, emoji="⏯️", row=0)
+    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = self.ctx.voice_client
+        if not vc:
+            return await interaction.response.send_message("⚠️ Bir kanalda değilim.", ephemeral=True)
+        
+        if vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message("⏸️ Müzik duraklatıldı.", ephemeral=True)
+        elif vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message("▶️ Müzik devam ediyor.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚠️ Şu an çalan bir şey yok.", ephemeral=True)
     
     @discord.ui.button(label="Geç", style=discord.ButtonStyle.primary, emoji="⏭️", row=0)
     async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.music_cog.skip(self.ctx)
         if not interaction.response.is_done(): await interaction.response.defer()
 
-    @discord.ui.button(label="Döngü", style=discord.ButtonStyle.secondary, emoji="🔁", row=0)
+    @discord.ui.button(label="Döngü", style=discord.ButtonStyle.secondary, emoji="🔁", row=1)
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.music_cog.loop_command(self.ctx)
         if not interaction.response.is_done(): await interaction.response.defer()
@@ -154,7 +169,6 @@ class Music(commands.Cog):
         if len(self.queue) > 0:
             self.is_playing = True
             
-            # Loop mantığı: Çalanı sona at
             if self.loop and hasattr(self, 'current_song_data'):
                  self.queue.append(self.current_song_data)
 
@@ -171,31 +185,52 @@ class Music(commands.Cog):
 
     async def play_music_async(self, ctx, query, display_title):
         try:
-            # Kullanıcıya hazırlanıyor mesajı (Editlenecek)
             msg = await ctx.send(f"💿 Hazırlanıyor: **{display_title}**...")
 
             source = await YTDLSource.from_url(query, loop=self.bot.loop, stream=True, filter_type=self.current_filter)
             if not ctx.voice_client: return
 
-            # Recursive (Kendini Çağıran) Yapı
             ctx.voice_client.play(source, after=lambda e: self.play_next(ctx))
             
-            # Mesajı güncelle
             loop_icon = "🔁" if self.loop else ""
             filter_tag = f" | 🎛️ {self.current_filter.capitalize()}" if self.current_filter != "normal" else ""
             await msg.edit(content=f"🎶 Şimdi Çalıyor: **{source.title}** {loop_icon}{filter_tag}")
             
         except Exception as e:
-            # Hata Olursa Çökme -> Sonrakine Geç (Auto-Recovery)
             await ctx.send(f"⚠️ Hata oluştu ({display_title}), sıradaki şarkıya geçiliyor...")
             print(f"Hata Detayı: {e}")
             self.play_next(ctx)
+
+    # --- YARDIMCI FONKSIYON: SPOTIFY VERİSİNİ ARKA PLANDA ÇEKME ---
+    def fetch_spotify_tracks(self, search):
+        """Bu fonksiyon Spotify verisini çekerken botu dondurmaz."""
+        tracks_to_add = []
+        try:
+            if "track" in search:
+                tracks_to_add.append(sp.track(search))
+            elif "playlist" in search:
+                results = sp.playlist_tracks(search)
+                tracks = results['items']
+                while results['next']:
+                    results = sp.next(results)
+                    tracks.extend(results['items'])
+                tracks_to_add = [t['track'] for t in tracks if t['track']]
+            elif "album" in search:
+                results = sp.album_tracks(search)
+                tracks_to_add = results['items']
+                while results['next']:
+                    results = sp.next(results)
+                    tracks_to_add.extend(results['items'])
+            return tracks_to_add
+        except Exception as e:
+            print(f"Spotify Fetch Hatası: {e}")
+            return []
 
     # --- KOMUTLAR ---
     @commands.command(name='balyanak')
     async def balyanak_panel(self, ctx):
         """Ana Paneli Açar"""
-        embed = discord.Embed(title="🍯 Balyanak Kontrol", description="Spotify, YouTube, Efektler & Daha Fazlası!", color=discord.Color.gold())
+        embed = discord.Embed(title="🍯 Balyanak Kontrol", description="Duraklat/Devam Eklendi! ⏯️", color=discord.Color.gold())
         if self.bot.user.avatar: embed.set_thumbnail(url=self.bot.user.avatar.url)
         view = MusicControlView(self, ctx)
         await ctx.send(embed=embed, view=view)
@@ -208,35 +243,19 @@ class Music(commands.Cog):
         async with ctx.typing():
             tracks_added = 0
             
-            # --- SPOTIFY ---
+            # --- SPOTIFY (OPTIMIZED) ---
             if "spotify.com" in search and SPOTIFY_ENABLED:
-                try:
-                    tracks_to_add = []
-                    if "track" in search:
-                        tracks_to_add.append(sp.track(search))
-                    elif "playlist" in search:
-                        results = sp.playlist_tracks(search)
-                        tracks = results['items']
-                        while results['next']:
-                            results = sp.next(results)
-                            tracks.extend(results['items'])
-                        tracks_to_add = [t['track'] for t in tracks if t['track']]
-                    elif "album" in search:
-                        results = sp.album_tracks(search)
-                        tracks_to_add = results['items']
-                        while results['next']:
-                            results = sp.next(results)
-                            tracks_to_add.extend(results['items'])
-                    
-                    for track in tracks_to_add:
-                        # Anahtar Kelime Oluştur (Lazy Loading)
+                # Bloklayan işlemi 'executor' ile arka plana atıyoruz. Bot donmuyor.
+                tracks = await self.bot.loop.run_in_executor(None, lambda: self.fetch_spotify_tracks(search))
+                
+                if tracks:
+                    for track in tracks:
                         query = f"{track['name']} {track['artists'][0]['name']} audio"
                         self.queue.append({'query': query, 'title': track['name']})
                         tracks_added += 1
-                    
                     await ctx.send(f"✅ Spotify'dan **{tracks_added}** şarkı eklendi!")
-                except Exception as e:
-                    await ctx.send(f"❌ Spotify Hatası: {e}")
+                else:
+                    await ctx.send("❌ Spotify verisi çekilemedi.")
 
             # --- YOUTUBE PLAYLIST ---
             elif "list=" in search:
@@ -271,6 +290,16 @@ class Music(commands.Cog):
             ctx.voice_client.stop()
         else:
             await ctx.send("⚠️ Çalan yok.")
+
+    @commands.command(name='pause')
+    async def pause_command(self, ctx):
+        """Müziği duraklatır."""
+        if ctx.voice_client and ctx.voice_client.is_playing():
+            ctx.voice_client.pause()
+            await ctx.send("⏸️ Duraklatıldı.")
+        elif ctx.voice_client and ctx.voice_client.is_paused():
+            ctx.voice_client.resume()
+            await ctx.send("▶️ Devam ediliyor.")
 
     @commands.command(name='loop')
     async def loop_command(self, ctx):
